@@ -232,6 +232,7 @@ enum {
   OPT_QUOTA_DISABLE,
   OPT_GC_LIST,
   OPT_GC_PROCESS,
+  OPT_GC_FIND,
   OPT_REGION_GET,
   OPT_REGION_LIST,
   OPT_REGION_SET,
@@ -441,6 +442,8 @@ static int get_cmd(const char *cmd, const char *prev_cmd, bool *need_more)
       return OPT_GC_LIST;
     if (strcmp(cmd, "process") == 0)
       return OPT_GC_PROCESS;
+    if (strcmp(cmd, "find") == 0)
+      return OPT_GC_FIND;
   } else if (strcmp(prev_cmd, "metadata") == 0) {
     if (strcmp(cmd, "get") == 0)
       return OPT_METADATA_GET;
@@ -904,6 +907,197 @@ int check_min_obj_stripe_size(RGWRados *store, RGWBucketInfo& bucket_info, rgw_o
   }
   *need_rewrite = false;
 
+  return 0;
+}
+
+
+#define NUM_ORPHAN_CHECK_SHARDS 10
+
+static const char *orphan_log_objs_prefix = "scan.objs";
+
+map<int, string> orphan_objs_log;
+
+#define HASH_PRIME 7877
+static int orphan_shard(const string& str)
+{
+  return ceph_str_hash_linux(str.c_str(), str.size()) % HASH_PRIME % NUM_ORPHAN_CHECK_SHARDS;
+}
+
+static int init_orphan_log(librados::IoCtx& log_ioctx)
+{
+  const char *log_pool = store->get_zone_params().log_pool.name.c_str();
+  librados::Rados *rados = store->get_rados();
+  int r = rados->ioctx_create(log_pool, log_ioctx);
+  if (r < 0) {
+    cerr << "ERROR: failed to open log pool ret=" << r << std::endl;
+    return r;
+  }
+
+  for (int i = 0; i < NUM_ORPHAN_CHECK_SHARDS; i++) {
+    char buf[128];
+
+    snprintf(buf, sizeof(buf), "%s.%d", orphan_log_objs_prefix, i);
+    orphan_objs_log[i] = buf;
+  }
+  return 0;
+}
+
+struct log_iter_info {
+  string oid;
+  list<string>::iterator cur;
+  list<string>::iterator end;
+};
+
+static int log_oids(librados::IoCtx& log_ioctx, map<int, list<string> >& oids)
+{
+  map<int, list<string> >::iterator miter = oids.begin();
+
+  list<log_iter_info> liters; /* a list of iterator pairs for begin and end */
+
+  for (; miter != oids.end(); ++miter) {
+    log_iter_info info;
+    info.oid = orphan_objs_log[miter->first];
+    info.cur = miter->second.begin();
+    info.end = miter->second.end();
+    liters.push_back(info);
+  }
+
+  list<log_iter_info>::iterator list_iter;
+  while (!liters.empty()) {
+     list_iter = liters.begin();
+
+     while (list_iter != liters.end()) {
+       log_iter_info cur_info = *list_iter;
+
+       list<string>::iterator& cur = cur_info.cur;
+       list<string>::iterator& end = cur_info.end;
+
+       map<string, bufferlist> entries;
+#define MAX_OMAP_SET_ENTRIES 100
+       for (int j = 0; cur != end && j != MAX_OMAP_SET_ENTRIES; ++cur, ++j) {
+         entries[*cur] = bufferlist();
+       }
+       librados::ObjectWriteOperation op;
+       op.omap_set(entries);
+       cout << "storing " << entries.size() << " entries at " << cur_info.oid << std::endl;
+       int ret = log_ioctx.operate(cur_info.oid, &op);
+       if (ret < 0) {
+         cerr << "ERROR: log_ioctx.operate(" << cur_info.oid << ") returned ret=" << ret << std::endl;
+       }
+       list<log_iter_info>::iterator tmp = list_iter;
+       ++list_iter;
+       if (cur == end) {
+         liters.erase(tmp);
+       }
+     }
+  }
+  return 0;
+}
+
+int get_all_bucket_instances(set<string>& markers, Formatter *formatter)
+{
+  void *handle;
+  int max = 1000;
+  string section = "bucket.instance";
+  int ret = store->meta_mgr->list_keys_init(section, &handle);
+  if (ret < 0) {
+    cerr << "ERROR: can't get key: " << cpp_strerror(-ret) << std::endl;
+    return -ret;
+  }
+
+  bool truncated;
+
+  formatter->open_array_section("keys");
+  RGWObjectCtx obj_ctx(store);
+
+  do {
+    list<string> keys;
+    ret = store->meta_mgr->list_keys_next(handle, max, keys, &truncated);
+    if (ret < 0) {
+      cerr << "ERROR: lists_keys_next(): " << cpp_strerror(-ret) << std::endl;
+      return -ret;
+    }
+
+    for (list<string>::iterator iter = keys.begin(); iter != keys.end(); ++iter) {
+      formatter->dump_string("key", *iter);
+      formatter->flush(cout);
+   
+      ssize_t pos = iter->find(':');
+      string bucket_id = iter->substr(pos + 1);
+      markers.insert(bucket_id);
+    }
+  } while (truncated);
+
+  formatter->close_section();
+  formatter->flush(cout);
+
+  store->meta_mgr->list_keys_complete(handle);
+
+  return 0;
+}
+
+int log_all_object_oids(librados::IoCtx& log_ioctx, const string& pool /*, set<string>& markers */)
+{
+  librados::Rados *rados = store->get_rados();
+
+  librados::IoCtx ioctx;
+
+  int ret = rados->ioctx_create(pool.c_str(), ioctx);
+  if (ret < 0) {
+    cerr << __func__ << ": ioctx_create() returned ret=" << ret << std::endl;
+    return ret;
+  }
+
+  ioctx.set_namespace(librados::all_nspaces);
+  librados::NObjectIterator i = ioctx.nobjects_begin();
+  librados::NObjectIterator i_end = ioctx.nobjects_end();
+
+  map<int, list<string> > oids;
+
+  int count = 0;
+
+  cout << "logging all objects in the pool" << std::endl;
+
+  for (; i != i_end; ++i) {
+    string nspace = i->get_nspace();
+    string oid = i->get_oid();
+    string locator = i->get_locator();
+
+    string name = oid;
+    if (locator.size())
+      name += " (@" + locator + ")";  
+
+    ssize_t pos = oid.find('_');
+    if (pos < 0) {
+      cerr << "ERROR: object does not have a bucket marker: " << oid << std::endl;
+    }
+    string obj_marker = oid.substr(0, pos);
+#if 0
+    if (markers.find(obj_marker) == markers.end()) {
+      cout << "POTENTIAL_LEAK: " << name << std::endl;
+    }
+#endif
+
+    int shard = orphan_shard(oid);
+    oids[shard].push_back(oid);
+
+#define COUNT_BEFORE_FLUSH 1000
+    if (++count >= COUNT_BEFORE_FLUSH) {
+      ret = log_oids(log_ioctx, oids);
+      if (ret < 0) {
+        cerr << __func__ << ": ERROR: log_oids() returned ret=" << ret << std::endl;
+        return ret;
+      }
+      count = 0;
+      oids.clear();
+    }
+  }
+  ret = log_oids(log_ioctx, oids);
+  if (ret < 0) {
+    cerr << __func__ << ": ERROR: log_oids() returned ret=" << ret << std::endl;
+    return ret;
+  }
+  
   return 0;
 }
 
@@ -2396,6 +2590,29 @@ next:
     if (ret < 0) {
       cerr << "ERROR: gc processing returned error: " << cpp_strerror(-ret) << std::endl;
       return 1;
+    }
+  }
+
+  if (opt_cmd == OPT_GC_FIND) {
+    if (pool_name.empty()) {
+      cerr << "ERROR: --pool_name not specified" << std::endl;
+      return EINVAL;
+    }
+    librados::IoCtx log_ioctx;
+    int ret = init_orphan_log(log_ioctx);
+    if (ret < 0) {
+      return -ret;
+    }
+#if 0
+    set<string> markers;
+    ret = get_all_bucket_instances(markers, formatter);
+    if (ret < 0) {
+      return -ret;
+    }
+#endif
+    ret = log_all_object_oids(log_ioctx, pool_name);
+    if (ret < 0) {
+      return -ret;
     }
   }
 
