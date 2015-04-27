@@ -3968,6 +3968,7 @@ reprotect_and_return_err:
                               req_comp);
       } else {
 	if(ictx->cct->_conf->rbd_skip_partial_discard) {
+	  delete req_comp;
 	  continue;
 	}
 	req = new AioZero(ictx, p->oid.name, p->objectno, p->offset, p->length,
