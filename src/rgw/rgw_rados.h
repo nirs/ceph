@@ -1595,14 +1595,15 @@ public:
     struct Stat {
       RGWRados::Object *source;
 
-      struct StatResult {
+      struct Result {
+        rgw_obj obj;
         RGWObjManifest manifest;
         bool has_manifest;
         uint64_t size;
         time_t mtime;
         map<string, bufferlist> attrs;
 
-        StatResult() : has_manifest(false), size(0), mtime(0) {}
+        Result() : has_manifest(false), size(0), mtime(0) {}
       } result;
 
       struct State {
